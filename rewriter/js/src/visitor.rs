@@ -92,7 +92,8 @@ where
 		// 	});
 		// } else {
 		//
-		if UNSAFE_GLOBALS.contains(&it.name.as_str()) {
+		// Add check for "setTimeout"
+		if it.name.as_str() != "setTimeout" && UNSAFE_GLOBALS.contains(&it.name.as_str()) {
 			self.jschanges.add(Rewrite::WrapFn {
 				span: it.span,
 				wrapped: false,
@@ -121,13 +122,35 @@ where
 				return; // unwise to walk the rest of the tree
 			}
 
-			if !self.config.strict_rewrites && !UNSAFE_GLOBALS.contains(&s.property.name.as_str()) {
+			// Handle setTimeout specifically
+			if s.property.name.as_str() == "setTimeout" {
+				// If the object is an identifier like 'window' or 'self',
+				// we don't walk it with walk::walk_expression to avoid WrapFn.
+				// It also implicitly skips scramitization for 'window.setTimeout' object.
+				if let Expression::Identifier(obj_ident) = &s.object {
+					if UNSAFE_GLOBALS.contains(&obj_ident.name.as_str()) {
+						// This is window.setTimeout or self.setTimeout.
+						// Do nothing for s.object here to prevent WrapFn and scramitization.
+					} else {
+						// someOtherObj.setTimeout, walk the object.
+						walk::walk_expression(self, &s.object);
+					}
+				} else {
+					// Complex object like foo().setTimeout, walk it.
+					// This will also apply scramitization to foo() if applicable by its own rules.
+					walk::walk_expression(self, &s.object);
+				}
+				// Walk the property "setTimeout" itself (won't be wrapped due to visit_identifier_reference change)
+				walk::walk_identifier_name(self, &s.property);
+				// Arguments are handled by visit_call_expression.
+				return; // Done with setTimeout member expression.
+			} else if !self.config.strict_rewrites && !UNSAFE_GLOBALS.contains(&s.property.name.as_str()) {
 				if let Expression::Identifier(_) | Expression::ThisExpression(_) = &s.object {
 					// cull tree - this should be safe
 					return;
 				}
 			}
-
+			// Default scramitization for other member expression objects
 			if self.config.scramitize
 				&& !matches!(s.object, Expression::MetaProperty(_) | Expression::Super(_))
 			{
