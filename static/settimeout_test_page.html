@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>SetTimeout Test</title>
+</head>
+<body>
+  <h1>SetTimeout Test Page</h1>
+  <script>
+    window.setTimeoutTestResults = {
+      direct: false,
+      windowScoped: false,
+      thisScopedGlobal: false,
+      errors: [],
+    };
+
+    // Listen for any errors on the page
+    window.addEventListener('error', (event) => {
+      window.setTimeoutTestResults.errors.push(event.message);
+    });
+    window.addEventListener('unhandledrejection', (event) => {
+      window.setTimeoutTestResults.errors.push(event.reason ? event.reason.message : 'Unhandled rejection');
+    });
+
+    try {
+      setTimeout(() => {
+        console.log('Test 1: Direct setTimeout executed.');
+        window.setTimeoutTestResults.direct = true;
+      }, 10);
+    } catch (e) {
+      console.error('Test 1 Error:', e);
+      window.setTimeoutTestResults.errors.push('Test 1 Error: ' + e.message);
+    }
+
+    try {
+      window.setTimeout(() => {
+        console.log('Test 2: window.setTimeout executed.');
+        window.setTimeoutTestResults.windowScoped = true;
+      }, 20);
+    } catch (e) {
+      console.error('Test 2 Error:', e);
+      window.setTimeoutTestResults.errors.push('Test 2 Error: ' + e.message);
+    }
+
+    try {
+      // 'this' in the global scope of a script tag, when proxied, might behave differently.
+      // In a browser, 'this' at the global scope is 'window'.
+      // We want to ensure that if 'this.setTimeout' is encountered and 'this' refers to 'window',
+      // it's handled correctly by the rewriter.
+      this.setTimeout(() => {
+        console.log('Test 3: this.setTimeout (global context) executed.');
+        window.setTimeoutTestResults.thisScopedGlobal = true;
+      }, 30);
+    } catch (e) {
+      console.error('Test 3 Error:', e);
+      window.setTimeoutTestResults.errors.push('Test 3 Error: ' + e.message);
+    }
+
+    // Add a small delay to allow setTimeout callbacks to fire
+    setTimeout(() => {
+      // Signal completion for Playwright to check
+      const doneEl = document.createElement('div');
+      doneEl.id = 'testsComplete';
+      document.body.appendChild(doneEl);
+      console.log('setTimeout tests on page marked as complete.');
+    }, 100); // Ensure this is long enough for other timeouts
+  </script>
+</body>
+</html>
