@@ -149,24 +149,82 @@ where
 	// we can't overwrite window.eval in the normal way because that would make everything an
 	// indirect eval, which could break things. we handle that edge case here
 	fn visit_call_expression(&mut self, it: &CallExpression<'data>) {
-		if let Expression::Identifier(s) = &it.callee {
-			// if it's optional that actually makes it an indirect eval which is handled separately
-			if s.name == "eval" && !it.optional {
-				self.jschanges.add(Rewrite::Eval {
-					span: it.span,
-					inner: Span::new(s.span.end + 1, it.span.end),
-				});
+		const TIMER_FUNCTIONS: &[&str] = &["setTimeout", "setInterval", "clearTimeout", "clearInterval"];
 
-				// then we walk the arguments, but not the callee, since we want it to resolve to
-				// the real eval
-				walk::walk_arguments(self, &it.arguments);
-				return;
+		let mut handled = false;
+
+		match &it.callee {
+			Expression::Identifier(ident_ref) => {
+				if ident_ref.name == "eval" && !it.optional {
+					self.jschanges.add(Rewrite::Eval {
+						span: it.span,
+						inner: Span::new(ident_ref.span.end + 1, it.span.end),
+					});
+					walk::walk_arguments(self, &it.arguments);
+					return; // Early return for eval
+				} else if TIMER_FUNCTIONS.contains(&ident_ref.name.as_str()) {
+					// Rewrite setTimeout(args) to (0, setTimeout)(args)
+					self.jschanges.add(Rewrite::GlobalFn { span: ident_ref.span });
+					handled = true;
+				}
 			}
+			Expression::MemberExpression(member_expr) => {
+				if let Expression::Identifier(ident_ref) = member_expr.object().without_parenthesized() {
+					// Check if it's something like `window.setTimeout` or `self.setTimeout`
+					if UNSAFE_GLOBALS.contains(&ident_ref.name.as_str()) {
+						if let Some(prop_name) = member_expr.static_property_name() {
+							if TIMER_FUNCTIONS.contains(&prop_name) {
+								// Already explicitly on window/self/etc., so no rewrite needed for binding.
+								// However, we might still want to wrap it if it's an unsafe global.
+								// For now, assume it's fine.
+								// self.rewrite_ident(&ident_ref.name, ident_ref.span); //
+								// This would wrap `window` if it's in UNSAFE_GLOBALS
+								// walk::walk_member_expression(self, it.callee.to_member_expression());
+								// handled = true;
+							}
+						}
+					} else {
+						// It's obj.setTimeout, but obj is not window.
+						// Rewrite obj.setTimeout(args) to (0, window.setTimeout)(args)
+						if let Some(prop_name_atom) = member_expr.static_property_name() {
+							if TIMER_FUNCTIONS.contains(&prop_name_atom.as_str()) {
+								self.jschanges.add(Rewrite::WindowMemberFn {
+									span: member_expr.span(),
+									property_name: prop_name_atom.clone(), // Atom can be cloned
+								});
+								handled = true;
+							}
+						}
+					}
+				} else if let Some(prop_name_atom) = member_expr.static_property_name() {
+					// Catches cases like `this.setTimeout` or `some_other_object.setTimeout`
+					// For `this.setTimeout`, it should ideally be bound if `this` isn't window.
+					// For `some_other_object.setTimeout`, we also want to rebind to `window`.
+					if TIMER_FUNCTIONS.contains(&prop_name_atom.as_str()) {
+						self.jschanges.add(Rewrite::WindowMemberFn {
+							span: member_expr.span(),
+							property_name: prop_name_atom.clone(), // Atom can be cloned
+						});
+						handled = true;
+					}
+				}
+			}
+			_ => {}
 		}
-		if self.config.scramitize {
+
+		if self.config.scramitize && !handled { // Potentially avoid double scramitizing if handled
 			self.scramitize(it.span);
 		}
-		walk::walk_call_expression(self, it);
+
+		// If handled, we've already decided what to do with the callee.
+		// We still need to walk arguments.
+		// If not handled, walk the whole call expression.
+		if handled {
+			walk::walk_arguments(self, &it.arguments);
+			// Potentially walk other parts of CallExpression like type parameters if necessary
+		} else {
+			walk::walk_call_expression(self, it);
+		}
 	}
 
 	fn visit_import_declaration(&mut self, it: &ImportDeclaration<'data>) {

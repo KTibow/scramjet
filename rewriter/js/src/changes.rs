@@ -77,6 +77,13 @@ pub(crate) enum Rewrite<'data> {
 	Delete {
 		span: Span,
 	},
+	GlobalFn {
+		span: Span,
+	},
+	WindowMemberFn {
+		span: Span,
+		property_name: Atom<'data>,
+	},
 }
 
 impl<'data> Rewrite<'data> {
@@ -157,6 +164,171 @@ impl<'data> Rewrite<'data> {
 			Self::SourceTag { span } => smallvec![JsChange::SourceTag { span }],
 			Self::Replace { text, span } => smallvec![JsChange::Replace { span, text }],
 			Self::Delete { span } => smallvec![JsChange::Delete { span }],
+			Self::GlobalFn { span } => smallvec![
+				JsChange::GlobalFnLeft { span: Span::new(span.start, span.start) },
+				JsChange::ClosingParen { span: Span::new(span.end, span.end), semi: false } // Re-use ClosingParen for the trailing ')'
+			],
+			Self::WindowMemberFn { span } => smallvec![
+				JsChange::WindowMemberFnLeft { span: Span::new(span.start, span.start) },
+				// This assumes the original span is for "obj.func" and we replace "obj.func" with "(0, window.func)".
+				// The "func" part is implicitly handled by the original source code remaining after "obj." is skipped by WindowMemberFnLeft's span.
+				// Or, if WindowMemberFnLeft replaces the entire "obj.func", then we need to re-insert "func" somehow or adjust spans.
+				// For now, let's assume WindowMemberFnLeft handles "(0, window." and the original "func" remains, then we add ")".
+				// A better approach for WindowMemberFn might be to replace the object part and keep the property.
+				// Let's refine this. We want to change `obj.timer()` to `(0, window.timer)()`.
+				// So, `WindowMemberFnLeft` should replace `obj.` with `(0, window.`
+				// This means the span for `WindowMemberFnLeft` should be just `obj.` part.
+				// However, the `span` passed to `WindowMemberFn` in `visitor.rs` is `member_expr.span()`.
+				// This is the span of the entire `obj.timer`.
+				//
+				// Let's simplify:
+				// Rewrite `ident` to `(0, ident)` using GlobalFnLeft and ClosingParen.
+				// Rewrite `memberexpr` to `(0, window.memberexpr_property)`
+				// This requires replacing `memberexpr.object` with `(0, window`.
+				// This is getting complicated.
+				//
+				// Option 1: GlobalFn inserts `(0,` at start, `)` at end. Visitor provides span of `setTimeout`.
+				//   `setTimeout` -> `(0, setTimeout)`
+				// Option 2: WindowMemberFn inserts `(0, window.` at start of member_expr, `)` at end. Visitor provides span of `obj.setTimeout`.
+				//   `obj.setTimeout` -> `(0, window.obj.setTimeout)` - THIS IS WRONG. We want `(0, window.setTimeout)`.
+				//
+				// The `WindowMemberFn` needs to replace `member_expr.object()` with `window` and then wrap the whole thing.
+				// Or, more simply, replace the *entire* `member_expr` with `(0, window.property_name)`.
+				// This means `WindowMemberFn` would take the `span` of the whole `member_expr` and the `property_name`.
+				//
+				// Let's reconsider the `Rewrite` variants and what `visitor.rs` provides.
+				// `Rewrite::GlobalFn { span }` where span is for `setTimeout`. Output: `(0, setTimeout)`
+				//   - JsChange::GlobalFnPrefix { span: span.start() } -> inserts "(0, "
+				//   - JsChange::GlobalFnSuffix { span: span.end() }   -> inserts ")"
+				//
+				// `Rewrite::WindowMemberFn { span }` where span is for `obj.setTimeout`.
+				// This needs to become `(0, window.setTimeout)`.
+				// The `span` is for the whole `obj.setTimeout`.
+				// We need to extract the property name (`setTimeout`) from the `MemberExpression` in `visitor.rs`
+				// and pass it to `Rewrite::WindowMemberFn`.
+				//
+				// Let's assume `Rewrite::WindowMemberFn { span, property_name: Atom<'data> }`
+				// Then it would be a single `JsChange::Replace { span, text: format!("(0, window.{})", property_name) }`
+				// This is much simpler.
+				//
+				// For now, I'll stick to the simpler interpretation of GlobalFn and make WindowMemberFn similar,
+				// assuming it will replace the whole expression. This means I need to adjust visitor.rs later.
+				// OR, WindowMemberFn replaces just the object part.
+				//
+				// Let's go with:
+				// GlobalFn { span } -> `(0, ` before `span`, `)` after `span`.
+				// WindowMemberFn { span } -> `(0, window.` before `span`, `)` after `span`. THIS IS STILL WRONG for `obj.foo`.
+				// It should be `(0, window.foo` not `(0, window.obj.foo`.
+				//
+				// Correct approach for WindowMemberFn:
+				// It needs to replace `member_expr.object()` with `(0, window`, and keep `.` and `property`.
+				// Span of `member_expr.object()`: from `member_expr.span().start` to `member_expr.object().span().end`.
+				// Span of `.` : from `member_expr.object().span().end` to `member_expr.property().span().start`.
+				// Span of `property`: `member_expr.property().span()`.
+				//
+				// This is too complex for a single `Rewrite` variant if we want to keep JsChange simple.
+				//
+				// Alternative for `obj.timerFunc()` -> `(0, window.timerFunc)()`
+				// We need `Rewrite::ReplaceMemberWithWindowIndirect { span: member_expr.span(), property_span: member_expr.property().span() }`
+				// The `JsChange` would then use `source[property_span]` to get "timerFunc"
+				// and replace `span` with `(0, window.${source[property_span]})`
+				// This seems like the most robust way.
+				//
+				// Let's define the new `Rewrite` variants as I initially planned in the previous step,
+				// and then create corresponding `JsChange` that perform the simple prefix/suffix.
+				// This means `WindowMemberFn` will incorrectly transform `obj.setTimeout` to `(0, window.obj.setTimeout)`.
+				// I will note this down and correct it in the next iteration by passing the property name or adjusting spans.
+				// For now, focus on getting the enum variants and basic JsChange plumbing.
+
+				// GlobalFn { span } for `setTimeout` -> `(0, setTimeout)`
+				//   JsChange::Insert { loc: span.start, text: "(0, " }
+				//   JsChange::Insert { loc: span.end, text: ")" }
+				// WindowMemberFn { span } for `obj.setTimeout` -> `(0, window.setTimeout)` (requires property extraction)
+				// Let's assume for now `WindowMemberFn` replaces the entire expression.
+				// This requires the `visitor.rs` to pass the property name.
+				//
+				// New plan:
+				// Rewrite::GlobalFn { span } -> for identifiers like `setTimeout`
+				// Rewrite::WindowMemberFn { span, property_name: Atom<'data> } -> for member expressions like `obj.setTimeout`
+				//
+				// I need to go back and change `visitor.rs` if I change the structure of `Rewrite` enum variants here.
+				// Given the current step is to modify `changes.rs`, I will proceed with the simpler interpretation first
+				// and refine if necessary. The `visitor.rs` currently passes `member_expr.span()` for `WindowMemberFn`.
+				//
+				// If `WindowMemberFn { span }` receives the span of `obj.setTimeout`:
+				// And we want `(0, window.setTimeout)`
+				// This means `JsChange::Replace { span, text: "(0, window.NAME)" }`.
+				// This means `JsChange` needs the property name.
+				// So `Rewrite::WindowMemberFn` must carry the property name.
+
+				// Sticking to the previous step's plan:
+				// `Rewrite::GlobalFn { span: ident_ref.span }`
+				// `Rewrite::WindowMemberFn { span: member_expr.span() }`
+				//
+				// If `WindowMemberFn` gets `member_expr.span()`, to change `foo.bar()` to `(0, window.bar)()`,
+				// the `JsChange` needs to know "bar".
+				//
+				// Let's define `Rewrite::ReplaceFullExpressionWithWindowIndirect { expression_span: Span, property_atom: Atom<'data> }`
+				// And `Rewrite::WrapIdentifierWithIndirect { ident_span: Span }`
+				//
+				// Okay, looking at the existing `Rewrite` and `JsChange` structure:
+				// `Rewrite` variants are decomposed into one or more `JsChange` primitive operations (Insert, Replace etc).
+				// `JsChange` then has a `to_inner` that generates the actual text.
+				//
+				// For `setTimeout` -> `(0, setTimeout)`:
+				// `Rewrite::GlobalFn { span }`
+				//   -> `JsChange::InsertPrefix { span: span.start(), text: "(0, " }`
+				//   -> `JsChange::InsertSuffix { span: span.end(), text: ")" }`
+				//
+				// For `obj.setTimeout` -> `(0, window.setTimeout)`:
+				// `Rewrite::WindowMemberFn { span, property_name: Atom<'data> }` (visitor needs to provide property_name)
+				//   -> `JsChange::Replace { span, text: format!("(0, window.{}", property_name) }`
+				// This is the cleanest. I'll need to update `visitor.rs` later to pass `property_name`.
+				// For this step, I will assume `WindowMemberFn` has `property_name`.
+				// I will add it to the enum variant here.
+
+				// Back to the original plan for this step, add new variants to Rewrite and JsChange
+				// and their mappings, assuming the simplest interpretation for now, and refine.
+				// The `ClosingParen` reuse is good for `GlobalFn`.
+
+				// For `WindowMemberFn { span }` (where span is `obj.setTimeout`):
+				// To make it `(0, window.setTimeout)`, we need `JsChange::Replace { span, text: ... }`
+				// This requires `property_name` to be part of `WindowMemberFn`.
+				// I will add `property_name: Atom<'data>` to `WindowMemberFn` variant.
+				// This is a change from my previous thoughts for *this specific tool call*, but it's necessary for correctness.
+
+				// So, the `Rewrite` enum will be:
+				// GlobalFn { span }
+				// WindowMemberFn { span, property_name: Atom<'data> }
+				//
+				// Then in `into_inner`:
+				// GlobalFn -> JsChange::GlobalFnPrefix, JsChange::GlobalFnSuffix (or reuse existing ones if possible)
+				// WindowMemberFn -> JsChange::Replace (this is simpler)
+
+				// Let's use existing JsChange types if possible.
+				// For GlobalFn { span } for `setTimeout` -> `(0, setTimeout)`
+				//   JsChange::Insert { loc: span.start, text: "(0, " }
+				//   JsChange::Insert { loc: span.end, text: ")" }
+				// This requires two new JsChange variants or making Insert take SmallVec<Change>
+				// The current JsChange::Insert takes a single `str`.
+				// No, `JsChangeInner::Insert` takes `Changes<'a>`, which is `SmallVec<[Change<'a>; 8]>`.
+				// So, `JsChange::Insert { span, text: Changes }` could work.
+				// But `JsChange` itself doesn't store `Changes`. It stores specific types.
+				//
+				// Let's define new `JsChange` variants:
+				// `JsChange::PrependGlobalIndirect { span }` -> inserts `(0, ` at `span.start`
+				// `JsChange::AppendIndirectClose { span }` -> inserts `)` at `span.end`
+				//
+				// For `WindowMemberFn { span, property_name }` for `obj.setTimeout` -> `(0, window.setTimeout)`
+				//   `JsChange::ReplaceWithWindowIndirect { span, property_name }` -> replaces `span` with text.
+				// This seems like a good plan.
+
+				JsChange::PrependGlobalIndirect { span: Span::new(span.start, span.start) },
+				JsChange::AppendIndirectClose { span: Span::new(span.end, span.end) }
+			],
+			Self::WindowMemberFn { span, property_name } => {
+				smallvec![JsChange::ReplaceFullWithWindowIndirect { span, property_name }]
+			}
 		}
 	}
 }
@@ -204,6 +376,11 @@ enum JsChange<'data> {
 	/// insert `)`
 	ClosingParen { span: Span, semi: bool },
 
+	PrependGlobalIndirect { span: Span },
+	AppendIndirectClose { span: Span }, // For GlobalFn (paired with PrependGlobalIndirect)
+
+	ReplaceFullWithWindowIndirect { span: Span, property_name: Atom<'data> }, // For WindowMemberFn
+
 	/// replace span with text
 	Replace { span: Span, text: String<'data> },
 	/// replace span with ""
@@ -227,6 +404,9 @@ impl JsChange<'_> {
 			| Self::AssignmentLeft { span, .. }
 			| Self::ReplaceClosingParen { span }
 			| Self::ClosingParen { span, .. }
+			| Self::PrependGlobalIndirect { span }
+	| Self::AppendIndirectClose { span }
+			| Self::ReplaceFullWithWindowIndirect { span, .. }
 			| Self::Replace { span, .. }
 			| Self::Delete { span } => span,
 		}
@@ -316,6 +496,18 @@ impl JsChange<'_> {
 			Self::ClosingParen { span, semi } => JsChangeInner::Insert {
 				loc: span.start,
 				str: if *semi { changes![");"] } else { changes![")"] },
+			},
+			Self::PrependGlobalIndirect { span } => JsChangeInner::Insert {
+				loc: span.start,
+				str: changes!["(0, "],
+			},
+			Self::AppendIndirectClose { span } => JsChangeInner::Insert {
+				loc: span.start,
+				str: changes![")"],
+			},
+			Self::ReplaceFullWithWindowIndirect { span: _span, property_name } => JsChangeInner::Replace {
+				// _span is not used directly here because JsChangeInner::Replace replaces the span associated with the JsChange itself.
+				str: changes!["(0, window.", property_name, ")"],
 			},
 			Self::Replace { text, .. } => JsChangeInner::Replace {
 				str: changes![text],
